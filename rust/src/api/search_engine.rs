@@ -10,9 +10,48 @@ use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, RegexQuery, TermQuery,
 use tantivy::query::{Query, RegexPhraseQuery};
 use tantivy::schema::Value;
 use tantivy::snippet::SnippetGenerator;
+use tantivy::tokenizer::{LowerCaser, RegexTokenizer, RemoveLongFilter, TextAnalyzer};
 use tantivy::{doc, DocAddress, IndexReader, IndexWriter, Order, ReloadPolicy, Score, Searcher};
 use tantivy::{schema::*, Index};
 use tantivy::{DocId, SegmentOrdinal, SegmentReader};
+
+/// Name of the custom tokenizer used for the `text` field.
+///
+/// Unlike Tantivy's default `SimpleTokenizer`, this tokenizer treats Hebrew
+/// quotation marks (״ ׳) and ASCII quotes (" ') as part of a token rather than
+/// as token separators. This keeps acronyms like "רמב״ם" and abbreviations like
+/// "תוס׳" indexed as a single token, so users searching for the exact form
+/// (with quotes) get matches, and searches without the quotes do **not** match
+/// the quoted form — i.e. results match exactly what the user typed.
+const HEBREW_AWARE_TOKENIZER: &str = "hebrew_aware";
+
+/// Regex pattern that defines a token for the Hebrew-aware tokenizer.
+///
+/// Matches runs of: Unicode alphabetic letters, decimal digits, ASCII single &
+/// double quotes, Hebrew gershayim (״, U+05F4) and Hebrew geresh (׳, U+05F3).
+/// Anything else (whitespace, punctuation like , ; . : ! ? ( ) [ ] etc., and
+/// Hebrew/ASCII hyphens which the application replaces with space before
+/// indexing) terminates a token.
+const HEBREW_AWARE_TOKEN_PATTERN: &str = r#"[\p{Alphabetic}\d"'״׳]+"#;
+
+/// Registers the [`HEBREW_AWARE_TOKENIZER`] on the given index.
+///
+/// Pipeline: `RegexTokenizer` (per [`HEBREW_AWARE_TOKEN_PATTERN`]) →
+/// `LowerCaser` (matching the behaviour of Tantivy's default `TEXT`) →
+/// `RemoveLongFilter` (drop tokens longer than 40 chars, again matching the
+/// default).
+fn register_hebrew_aware_tokenizer(index: &Index) {
+    let analyzer = TextAnalyzer::builder(
+        RegexTokenizer::new(HEBREW_AWARE_TOKEN_PATTERN)
+            .expect("hebrew-aware token pattern must be a valid regex"),
+    )
+    .filter(RemoveLongFilter::limit(40))
+    .filter(LowerCaser)
+    .build();
+    index
+        .tokenizers()
+        .register(HEBREW_AWARE_TOKENIZER, analyzer);
+}
 
 // ── Public data types ──────────────────────────────────────────────────────────
 
@@ -76,7 +115,19 @@ impl SearchEngine {
     pub fn new(path: &str) -> Self {
         debug!("new path={}", path);
         let mut schema_builder = Schema::builder();
-        schema_builder.add_text_field("text", TEXT | STORED | FAST);
+        // The `text` field uses a custom tokenizer (registered below on the
+        // index) that keeps quotes inside tokens — see HEBREW_AWARE_TOKENIZER.
+        // `FAST` is dropped here vs. the previous `TEXT | STORED | FAST`: only
+        // `id` and `filePath` use fast-field access, so the text fast field
+        // had no consumer.
+        let text_options = TextOptions::default()
+            .set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer(HEBREW_AWARE_TOKENIZER)
+                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+            )
+            .set_stored();
+        schema_builder.add_text_field("text", text_options);
         schema_builder.add_text_field("reference", STORED);
         schema_builder.add_text_field(
             "title",
@@ -99,6 +150,7 @@ impl SearchEngine {
         let mmap_directory = MmapDirectory::open(path).expect("unable to open mmap directory");
         let index =
             Index::open_or_create(mmap_directory, schema.clone()).expect("Failed to create index");
+        register_hebrew_aware_tokenizer(&index);
         let index_reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
@@ -885,6 +937,64 @@ mod tests {
             .into_iter()
             .map(|result| result.id)
             .collect()
+    }
+
+    // ── Hebrew-aware tokenizer ────────────────────────────────────────────
+    //
+    // The custom tokenizer (registered in `SearchEngine::new`) keeps quotes
+    // inside tokens so acronyms / abbreviations stay searchable as exactly
+    // what the user typed. These tests pin that behaviour.
+
+    #[test]
+    fn hebrew_aware_tokenizer_keeps_gershayim_inside_acronyms() {
+        let (mut engine, _dir) = make_engine();
+        // No grammatical prefix on the acronym — tantivy's RegexQuery does a
+        // full match against indexed terms, so the token must equal the query.
+        add(&mut engine, 1, "כתב רמב״ם בהלכות", "/books/a.txt");
+        add(&mut engine, 2, "אמר רש\"י על הפסוק", "/books/b.txt");
+        engine.commit().unwrap();
+
+        // Exact form (Hebrew gershayim) finds its document — and only its
+        // document, because the tokenizer keeps the quote inside the token.
+        assert_eq!(search_ids(&mut engine, "רמב״ם"), vec![1]);
+        assert_eq!(search_ids(&mut engine, "רש\"י"), vec![2]);
+        // Hebrew and Latin double-quote forms are *different* tokens.
+        assert_eq!(search_ids(&mut engine, "רמב\"ם"), Vec::<u64>::new());
+        assert_eq!(search_ids(&mut engine, "רש״י"), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn hebrew_aware_tokenizer_keeps_geresh_at_word_end() {
+        let (mut engine, _dir) = make_engine();
+        add(&mut engine, 1, "תוס׳ ד\"ה כתב", "/books/a.txt");
+        add(&mut engine, 2, "תוס' לועזי", "/books/b.txt");
+        engine.commit().unwrap();
+
+        assert_eq!(search_ids(&mut engine, "תוס׳"), vec![1]);
+        assert_eq!(search_ids(&mut engine, "תוס'"), vec![2]);
+    }
+
+    #[test]
+    fn hebrew_aware_tokenizer_does_not_match_quoted_form_for_unquoted_query() {
+        let (mut engine, _dir) = make_engine();
+        add(&mut engine, 1, "תוס׳ פירוש", "/books/a.txt");
+        add(&mut engine, 2, "תוס פשוט", "/books/b.txt");
+        engine.commit().unwrap();
+
+        // Searching `תוס` returns only the document where the word is
+        // literally `תוס` — `תוס׳` is a different token and is NOT a match.
+        assert_eq!(search_ids(&mut engine, "תוס"), vec![2]);
+    }
+
+    #[test]
+    fn hebrew_aware_tokenizer_splits_on_punctuation_and_whitespace() {
+        let (mut engine, _dir) = make_engine();
+        add(&mut engine, 1, "שלום, חבר!", "/books/a.txt");
+        engine.commit().unwrap();
+
+        // Comma and exclamation must split tokens, just like whitespace.
+        assert_eq!(search_ids(&mut engine, "שלום"), vec![1]);
+        assert_eq!(search_ids(&mut engine, "חבר"), vec![1]);
     }
 
     #[test]
