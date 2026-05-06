@@ -27,12 +27,33 @@ const HEBREW_AWARE_TOKENIZER: &str = "hebrew_aware";
 
 /// Regex pattern that defines a token for the Hebrew-aware tokenizer.
 ///
-/// Matches runs of: Unicode alphabetic letters, decimal digits, ASCII single &
-/// double quotes, Hebrew gershayim (״, U+05F4) and Hebrew geresh (׳, U+05F3).
+/// Anatomy: `A (Q+ A)* G?` where
+/// * `A = [\p{Alphabetic}\d]+` — a run of letters and/or digits,
+/// * `Q = ["'״׳]` — any of the four quote characters (ASCII single & double,
+///   Hebrew gershayim ״ U+05F4, Hebrew geresh ׳ U+05F3),
+/// * `G = ['׳]`  — only the *single*-quote forms, allowed at the end.
+///
+/// Why this shape:
+/// 1. A token must start with an alphanumeric, so leading punctuation —
+///    including the opening `"` of a quoted phrase like `"דברי"` — is left
+///    out of the token. Otherwise users typing the bare word would not match
+///    the quoted occurrence (Tantivy's `RegexQuery` is full-match against an
+///    indexed term).
+/// 2. Quotes between alphanumeric runs (`A Q A`) stay inside the token so
+///    Hebrew acronyms like `רמב״ם` and `רש"י` index as one unit.
+/// 3. A trailing single quote / Hebrew geresh (`'` or `׳`) IS kept, because
+///    those are the conventional Hebrew abbreviation markers (`תוס'`,
+///    `תוס׳`, `כ׳`, …); searching with them must remain distinct from
+///    searching without.
+/// 4. A trailing double quote (`"` or `״`) is NOT kept — those overwhelmingly
+///    appear in Hebrew text as the closing of a quoted phrase, not as part
+///    of the word.
+///
 /// Anything else (whitespace, punctuation like , ; . : ! ? ( ) [ ] etc., and
 /// Hebrew/ASCII hyphens which the application replaces with space before
 /// indexing) terminates a token.
-const HEBREW_AWARE_TOKEN_PATTERN: &str = r#"[\p{Alphabetic}\d"'״׳]+"#;
+const HEBREW_AWARE_TOKEN_PATTERN: &str =
+    r#"[\p{Alphabetic}\d]+(?:["'״׳]+[\p{Alphabetic}\d]+)*['׳]?"#;
 
 /// Registers the [`HEBREW_AWARE_TOKENIZER`] on the given index.
 ///
@@ -995,6 +1016,42 @@ mod tests {
         // Comma and exclamation must split tokens, just like whitespace.
         assert_eq!(search_ids(&mut engine, "שלום"), vec![1]);
         assert_eq!(search_ids(&mut engine, "חבר"), vec![1]);
+    }
+
+    #[test]
+    fn hebrew_aware_tokenizer_strips_surrounding_double_quotes() {
+        // Surrounding double quotes are punctuation around a quoted phrase,
+        // not part of the word — typing the bare word should still find it.
+        let (mut engine, _dir) = make_engine();
+        add(&mut engine, 1, "אמר \"דברי\" חכמה", "/books/a.txt");
+        add(&mut engine, 2, "פתח \"שלום\"", "/books/b.txt");
+        engine.commit().unwrap();
+
+        assert_eq!(search_ids(&mut engine, "דברי"), vec![1]);
+        assert_eq!(search_ids(&mut engine, "שלום"), vec![2]);
+        // The literal `"שלום"` form must NOT find anything — quotes were
+        // stripped from the token at index time.
+        assert_eq!(search_ids(&mut engine, "\"שלום\""), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn hebrew_aware_tokenizer_keeps_trailing_geresh_but_not_double_quote() {
+        let (mut engine, _dir) = make_engine();
+        // `תוס'` and `תוס׳` keep their trailing geresh — abbreviation marker.
+        add(&mut engine, 1, "תוס'", "/books/a.txt");
+        add(&mut engine, 2, "תוס׳", "/books/b.txt");
+        // `דברי"` ends in a double quote (closing a quotation) — that quote
+        // is dropped from the token, so the bare word `דברי` matches.
+        add(&mut engine, 3, "דברי\"", "/books/c.txt");
+        engine.commit().unwrap();
+
+        assert_eq!(search_ids(&mut engine, "תוס'"), vec![1]);
+        assert_eq!(search_ids(&mut engine, "תוס׳"), vec![2]);
+        // Bare `תוס` matches NEITHER — exact-match semantics.
+        assert_eq!(search_ids(&mut engine, "תוס"), Vec::<u64>::new());
+        // Bare `דברי` finds the document with `דברי"` because the trailing
+        // double quote was stripped from the token.
+        assert_eq!(search_ids(&mut engine, "דברי"), vec![3]);
     }
 
     #[test]
