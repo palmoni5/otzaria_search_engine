@@ -278,6 +278,47 @@ mod tests {
     }
 
     #[test]
+    fn test_hebrew_chars_normalized_inside_token_end_to_end() {
+        // כל קלט עם תווים עבריים (׳/״) — אחרי הטוקניזציה הטוקן מכיל רק
+        // את התווים הלועזיים (' ו-"). זה מבטיח התאמה מלאה לפלט של
+        // sanitizeQuery בצד הדארט שמקדים את ההמרה לפני הרגקס.
+        assert_eq!(tokenize("תוס\u{05F3}"), vec!["תוס'"]);
+        assert_eq!(tokenize("רמב\u{05F4}ם"), vec!["רמב\"ם"]);
+        assert_eq!(tokenize("ג\u{05F3}ורג\u{05F3}"), vec!["ג'ורג'"]);
+        assert_eq!(
+            tokenize("רמב\u{05F4}ם תוס\u{05F3}"),
+            vec!["רמב\"ם", "תוס'"]
+        );
+        assert_eq!(
+            tokenize("הרב פלוני ז\u{05F4}ל"),
+            vec!["הרב", "פלוני", "ז\"ל"]
+        );
+    }
+
+    #[test]
+    fn test_no_hebrew_geresh_or_gershayim_in_output() {
+        // ערובה: הטוקנים לעולם לא יכילו ׳ (U+05F3) או ״ (U+05F4).
+        let inputs = [
+            "ג\u{05F3}ורג\u{05F3}",
+            "רמב\u{05F4}ם",
+            "תוס\u{05F3} ד\u{05F4}ה",
+            "א\u{05F4}ב\u{05F3}ג",
+        ];
+        for input in inputs {
+            for tok in tokenize(input) {
+                assert!(
+                    !tok.contains('\u{05F3}'),
+                    "טוקן `{tok}` (קלט: `{input}`) מכיל ׳ עברי",
+                );
+                assert!(
+                    !tok.contains('\u{05F4}'),
+                    "טוקן `{tok}` (קלט: `{input}`) מכיל ״ עברי",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_plain_words() {
         assert_eq!(tokenize("שלום עולם"), vec!["שלום", "עולם"]);
     }
