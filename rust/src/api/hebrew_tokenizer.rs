@@ -2,6 +2,8 @@ use tantivy::tokenizer::{Token, TokenStream, Tokenizer};
 
 /// טוקנייזר עברי שמתנהג כמו SimpleTokenizer, אבל:
 ///   • שומר גרש (' או ׳) בסוף טוקן.
+///   • שומר גרש (' או ׳) בתוך טוקן כשהוא מוקף בתווי-מילה משני הצדדים
+///     (למשל תעתיקים כגון "ג'ורג'", "צ'יפס", או קידומות לועזיות "ד'אש").
 ///   • שומר גרשיים (" או ״) בתוך טוקן כשהם מוקפים בתווי-מילה משני הצדדים
 ///     (למשל ראשי-תיבות עבריים כגון "רמב״ם", "ד״ה").
 ///
@@ -11,9 +13,9 @@ use tantivy::tokenizer::{Token, TokenStream, Tokenizer};
 /// דוגמאות:
 ///   "תוס'"   → ["תוס'"]      (גרש בסוף — נשמר)
 ///   "תוס׳"   → ["תוס'"]      (גרש עברי בסוף — מנורמל לגרש לועזי)
+///   "ג'ורג'" → ["ג'ורג'"]    (גרש בין אותיות + גרש סופי — שניהם נשמרים)
 ///   "רמב\"ם" → ["רמב\"ם"]    (גרשיים בין אותיות — חלק מהטוקן)
 ///   "רמב״ם"  → ["רמב\"ם"]    (גרשיים עבריים בין אותיות — מנורמל ל-")
-///   "ד'אש"   → ["ד", "אש"]   (גרש באמצע ללא תוקף סופי — מפריד)
 ///   "תוס' ד\"ה" → ["תוס'", "ד\"ה"]
 #[derive(Clone, Default)]
 pub struct HebrewTokenizer;
@@ -97,11 +99,13 @@ impl<'a> HebrewTokenStream<'a> {
             }
 
             if is_geresh(c) {
+                // גרש בין אותיות — חלק מהטוקן (תעתיקים: ג'ורג', צ'יפס, ד'אש).
                 if next_is_word {
-                    // גרש באמצע — מפריד
-                    break;
+                    byte_pos += c_len;
+                    tok_end = byte_pos;
+                    continue;
                 }
-                // גרש סופי — חלק מהטוקן ואז סיום
+                // גרש סופי (לפני רווח/EOF) — נכלל ומסיים את הטוקן.
                 byte_pos += c_len;
                 tok_end = byte_pos;
                 break;
@@ -118,7 +122,7 @@ impl<'a> HebrewTokenStream<'a> {
     /// במסלול המהיר (אין תווים שדורשים נורמליזציה — הרוב המכריע של הטוקנים)
     /// מתבצע `push_str` יחיד מה-slice של המקור, בלי הקצאות וללא לולאת char.
     fn append_token_text(out: &mut String, slice: &str) {
-        if slice.contains(|c: char| matches!(c, '\u{05F3}' | '\u{05F4}')) {
+        if slice.contains(['\u{05F3}', '\u{05F4}']) {
             for c in slice.chars() {
                 match c {
                     '\u{05F3}' => out.push('\''),
@@ -193,13 +197,29 @@ mod tests {
     }
 
     #[test]
-    fn test_geresh_in_middle_splits() {
-        assert_eq!(tokenize("ד'אש"), vec!["ד", "אש"]);
+    fn test_interior_geresh_kept() {
+        // גרש בין אותיות נשמר כחלק מהטוקן (תעתיקים: ג'ורג', צ'יפס, ד'אש).
+        assert_eq!(tokenize("ד'אש"), vec!["ד'אש"]);
+        assert_eq!(tokenize("ג'ורג'"), vec!["ג'ורג'"]);
+        assert_eq!(tokenize("צ'יפס"), vec!["צ'יפס"]);
     }
 
     #[test]
-    fn test_hebrew_geresh_in_middle_still_splits() {
-        assert_eq!(tokenize("ד\u{05F3}אש"), vec!["ד", "אש"]);
+    fn test_hebrew_interior_geresh_normalized() {
+        // ׳ עברי בין אותיות נכלל ומנורמל ל-' לועזי.
+        assert_eq!(tokenize("ד\u{05F3}אש"), vec!["ד'אש"]);
+    }
+
+    #[test]
+    fn test_hebrew_and_ascii_interior_geresh_produce_same_token() {
+        assert_eq!(tokenize("ג\u{05F3}ורג\u{05F3}"), tokenize("ג'ורג'"));
+    }
+
+    #[test]
+    fn test_double_geresh_splits() {
+        // '' אינו "גרש פנימי" (התו אחריו לא תו-מילה) — נכלל הראשון כסופי
+        // והשני נדלג, ואז המילה הבאה מתפצלת לטוקן נפרד.
+        assert_eq!(tokenize("רמב''ם"), vec!["רמב'", "ם"]);
     }
 
     // ── גרשיים (" / ״) ──────────────────────────────────────────────────────
