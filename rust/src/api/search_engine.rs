@@ -1,12 +1,14 @@
 use crate::frb_generated::StreamSink;
 use anyhow::{Context, Result};
 use flutter_rust_bridge::frb;
-use log::debug;
+use log::{debug, error};
 use std::collections::HashMap;
 use tantivy::collector::{Collector, Count, FacetCollector, SegmentCollector, TopDocs};
 use tantivy::directory::MmapDirectory;
 use tantivy::indexer::NoMergePolicy;
-use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, RegexQuery, TermQuery, TermSetQuery};
+use tantivy::query::{
+    BooleanQuery, ConstScoreQuery, FuzzyTermQuery, Occur, RegexQuery, TermQuery, TermSetQuery,
+};
 use tantivy::query::{Query, RegexPhraseQuery};
 use tantivy::schema::Value;
 use tantivy::snippet::SnippetGenerator;
@@ -643,7 +645,7 @@ impl SearchEngine {
         let topics_field = schema.get_field("topics").unwrap();
 
         let main_query: Box<dyn Query> = if regex_terms.len() == 1 {
-            Box::new(RegexQuery::from_pattern(&regex_terms[0], text_field)?)
+            Self::build_single_term_query(&regex_terms[0], text_field)?
         } else {
             let mut phrase_query = RegexPhraseQuery::new(text_field, regex_terms);
             phrase_query.set_slop(slop);
@@ -661,6 +663,62 @@ impl SearchEngine {
             (Occur::Must, main_query),
             (Occur::Must, Box::new(facets_query) as Box<dyn Query>),
         ])))
+    }
+
+    /// בונה את שאילתת המילה הבודדת.
+    ///
+    /// תבנית של מילה בודדת היא לרוב אלטרנציה `(a|b|c|...)` של וריאציות
+    /// (כתיב מלא/חסר, שגיאות כתיב, חלק-ממילה וכו'). אם בונים מזה רגקס יחיד,
+    /// ה-DFA שלו עלול לחרוג ממגבלת ה-1000 states של Tantivy — בעיקר בשילוב
+    /// "חלק ממילה" + "שגיאות כתיב" (48 וריאציות, כל אחת עטופה ב-`.{0,n}…{0,n}`),
+    /// ואז `RegexQuery::from_pattern` נכשל והחיפוש מחזיר 0 תוצאות.
+    ///
+    /// לכן מפצלים את האלטרנציה ל-`RegexQuery` נפרד לכל ענף (כל אחד DFA זעיר)
+    /// ומאחדים ב-`BooleanQuery(Should)` — סמנטיקה זהה (OR), אך ללא התפוצצות.
+    /// כך גם מילה ארוכה עם אפשרות בודדת לעולם לא חורגת מהמגבלה.
+    fn build_single_term_query(pattern: &str, text_field: Field) -> Result<Box<dyn Query>> {
+        let mut alternatives = split_top_level_alternatives(pattern);
+        if alternatives.is_empty() {
+            alternatives.push(pattern.to_string());
+        }
+
+        let mut sub_queries: Vec<(Occur, Box<dyn Query>)> =
+            Vec::with_capacity(alternatives.len());
+        for alt in &alternatives {
+            // קליטת שגיאות: אם ענף בודד עדיין נכשל בקומפילציה, נקלט כאן עם לוג
+            // מפורט והקשר ברור במקום שגיאה אטומה שנבלעת בשקט בצד Dart.
+            let regex = RegexQuery::from_pattern(alt, text_field)
+                .map_err(|err| {
+                    error!(
+                        "RegexQuery compilation failed ({} chars): {err}. \
+                         Alternative prefix: {}",
+                        alt.chars().count(),
+                        alt.chars().take(80).collect::<String>(),
+                    );
+                    err
+                })
+                .with_context(|| {
+                    format!(
+                        "failed to compile regex alternative (length {} chars)",
+                        alt.chars().count()
+                    )
+                })?;
+            sub_queries.push((Occur::Should, Box::new(regex) as Box<dyn Query>));
+        }
+
+        if sub_queries.len() == 1 {
+            // ענף יחיד — שאילתה ישירה, ללא עטיפה מיותרת. RegexQuery יחיד הוא
+            // ConstScorer בציון 1.0, בדיוק כמו ההתנהגות הקודמת.
+            Ok(sub_queries.pop().unwrap().1)
+        } else {
+            // BooleanQuery(Should) מסכם את ציוני הענפים, כך שמסמך התואם ליותר
+            // וריאציות היה מקבל ציון גבוה יותר ומשנה את סדר ה-Relevance לעומת
+            // ההתנהגות הקודמת (RegexQuery יחיד = ConstScorer בציון 1.0). עטיפה
+            // ב-ConstScoreQuery משמרת ציון קבוע 1.0 לכל מסמך תואם, ללא תלות
+            // במספר הוריאציות שהתאימו — סמנטיקה זהה גם בדירוג, לא רק ב-hit/miss.
+            let union = BooleanQuery::new(sub_queries);
+            Ok(Box::new(ConstScoreQuery::new(Box::new(union), 1.0)))
+        }
     }
 
     fn collect_addresses(
@@ -860,6 +918,144 @@ impl SegmentCollector for BookCountSegmentCollector {
     }
 }
 
+/// מצב סריקה של מחלקת-תווים `[...]`, לזיהוי `|`/`(`/`)` שהם ספרותיים בתוכה.
+///
+/// מחזיק את הלוגיקה של "מתי `]` סוגר את המחלקה": `]` מיד אחרי `[` (או אחרי
+/// `[^`) הוא תו ספרותי ולא סוגר — בדיוק כמו ב-regex-syntax. שיתוף הלוגיקה בין
+/// שתי הפונקציות מונע סטייה ביניהן.
+#[derive(Default)]
+struct CharClassScanner {
+    in_class: bool,
+    index: usize, // תווים מאז `[` (לכלל ה-`]` הספרותי המוביל)
+    negated: bool,
+}
+
+impl CharClassScanner {
+    /// מעבד תו כשנמצאים בתוך מחלקת-תווים. מחזיר `true` אם התו נצרך כאן.
+    fn consume_inside(&mut self, ch: char) -> bool {
+        if !self.in_class {
+            return false;
+        }
+        if self.index == 0 && ch == '^' {
+            self.negated = true;
+        } else {
+            let literal_close_index = if self.negated { 1 } else { 0 };
+            if ch == ']' && self.index > literal_close_index {
+                self.in_class = false;
+            }
+        }
+        self.index += 1;
+        true
+    }
+
+    /// פותח מחלקת-תווים חדשה (נקרא כשנתקלים ב-`[` מחוץ למחלקה).
+    fn open(&mut self) {
+        self.in_class = true;
+        self.index = 0;
+        self.negated = false;
+    }
+}
+
+/// מפצל תבנית רגקס לאלטרנטיבות ברמה העליונה (depth 0).
+///
+/// `(a|b|c)` → `["a", "b", "c"]`. הפיצול מודע לעומק סוגריים, לתווי escape
+/// ולמחלקות-תווים `[...]`, כך ש:
+/// - אלטרנטיבה שמכילה קבוצה פנימית משלה (למשל `(x|y)` מצירוף כתיב-מלא עם
+///   דקדוק) נשארת שלמה ולא מפוצלת,
+/// - `|` בתוך מחלקת-תווים (למשל `[ם|ן]`) אינו נחשב מפריד ואינו שובר את הרגקס.
+///
+/// תבנית ללא אלטרנציה ברמה העליונה (למשל `משה` או `.{0,2}משה.{0,2}`) מוחזרת
+/// כאיבר יחיד.
+fn split_top_level_alternatives(pattern: &str) -> Vec<String> {
+    let inner = strip_enclosing_group(pattern);
+
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut depth: i32 = 0;
+    let mut escaped = false;
+    let mut class = CharClassScanner::default();
+
+    for ch in inner.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            current.push(ch);
+            escaped = true;
+            continue;
+        }
+        if class.consume_inside(ch) {
+            current.push(ch);
+            continue;
+        }
+        match ch {
+            '[' => {
+                class.open();
+                current.push(ch);
+            }
+            '(' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            '|' if depth == 0 => parts.push(std::mem::take(&mut current)),
+            _ => current.push(ch),
+        }
+    }
+    parts.push(current);
+
+    parts.into_iter().filter(|p| !p.is_empty()).collect()
+}
+
+/// אם התבנית פותחת ב-`(` שנסגר בדיוק בתו האחרון — מחזיר את התוכן הפנימי
+/// (בלי הסוגריים העוטפים), אחרת מחזיר את התבנית כמות שהיא. מודע לתווי escape,
+/// לקבוצות מקוננות ולמחלקות-תווים `[...]` (כך ש-`(`/`)` בתוך מחלקה אינם
+/// משפיעים על העומק), ולא מסיר סוגריים שאינם עוטפים את כל התבנית (כמו
+/// `(ו|מ)?משה` שבו הקבוצה הראשונה נסגרת באמצע).
+fn strip_enclosing_group(pattern: &str) -> &str {
+    if !pattern.starts_with('(') {
+        return pattern;
+    }
+    let mut depth: i32 = 0;
+    let mut escaped = false;
+    let mut class = CharClassScanner::default();
+    for (i, ch) in pattern.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if class.consume_inside(ch) {
+            continue;
+        }
+        match ch {
+            '[' => class.open(),
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    // הקבוצה הראשונה נסגרה — עוטפת את כל התבנית רק אם זה התו האחרון.
+                    return if i == pattern.len() - 1 {
+                        &pattern[1..i]
+                    } else {
+                        pattern
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    pattern
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -903,6 +1099,101 @@ mod tests {
             .into_iter()
             .map(|result| result.id)
             .collect()
+    }
+
+    // ── Single-term alternation split (1000-state-limit fix) ─────────────
+
+    #[test]
+    fn split_alternatives_basic() {
+        // אין אלטרנציה — איבר יחיד.
+        assert_eq!(split_top_level_alternatives("משה"), vec!["משה"]);
+        assert_eq!(
+            split_top_level_alternatives(".{0,2}משה.{0,2}"),
+            vec![".{0,2}משה.{0,2}"]
+        );
+        // אלטרנציה פשוטה.
+        assert_eq!(split_top_level_alternatives("(a|b|c)"), vec!["a", "b", "c"]);
+        // ענפי wildcard נשארים שלמים ({n,m} אינם סוגריים).
+        assert_eq!(
+            split_top_level_alternatives("(.{0,2}משה.{0,2}|.{0,2}מסה.{0,2})"),
+            vec![".{0,2}משה.{0,2}", ".{0,2}מסה.{0,2}"]
+        );
+        // קבוצה מקוננת בתוך ענף — לא מפוצלת.
+        assert_eq!(
+            split_top_level_alternatives("((ו|מ)?משה|בית)"),
+            vec!["(ו|מ)?משה", "בית"]
+        );
+        // קבוצה שאינה עוטפת את הכל — נשארת כענף יחיד.
+        assert_eq!(split_top_level_alternatives("(ו|מ)?משה"), vec!["(ו|מ)?משה"]);
+        // `|` בתוך מחלקת-תווים אינו מפריד.
+        assert_eq!(split_top_level_alternatives("[ם|ן]"), vec!["[ם|ן]"]);
+        assert_eq!(
+            split_top_level_alternatives("a|[x|y]|b"),
+            vec!["a", "[x|y]", "b"]
+        );
+        // דוגמת ה-benchmark: `|` בתוך `[...]` בתוך קבוצה — לא נשבר.
+        assert_eq!(
+            split_top_level_alternatives("([א-ת]{2,4}(ים|ות|ה)?)|([א-ת]+[יו][ם|ן])"),
+            vec!["([א-ת]{2,4}(ים|ות|ה)?)", "([א-ת]+[יו][ם|ן])"]
+        );
+        // `]` מוביל הוא ספרותי, לא סוגר את המחלקה.
+        assert_eq!(split_top_level_alternatives("[]|]"), vec!["[]|]"]);
+        // escape של `|` אינו מפריד.
+        assert_eq!(split_top_level_alternatives(r"a\|b"), vec![r"a\|b"]);
+    }
+
+    #[test]
+    fn multi_branch_query_keeps_constant_score() {
+        // מסמך התואם לשתי וריאציות לא יקבל ציון גבוה ממסמך התואם לאחת —
+        // העטיפה ב-ConstScoreQuery משמרת את סדר ה-Relevance של RegexQuery יחיד.
+        let (mut engine, _dir) = make_engine();
+        add(&mut engine, 1, "משה", "/books/a.txt"); // תואם ענף אחד
+        add(&mut engine, 2, "משה מסה", "/books/b.txt"); // תואם שני ענפים
+        engine.commit().unwrap();
+
+        let text_field = engine.index.schema().get_field("text").unwrap();
+        let query = SearchEngine::build_single_term_query("(משה|מסה)", text_field).unwrap();
+
+        let reader = engine.index.reader().unwrap();
+        let searcher = reader.searcher();
+        let collector = TopDocs::with_limit(10).order_by_score();
+        let hits: Vec<(Score, DocAddress)> = searcher.search(&*query, &collector).unwrap();
+
+        assert_eq!(hits.len(), 2, "שני המסמכים נמצאים");
+        for (score, _addr) in &hits {
+            assert!(
+                (*score - 1.0).abs() < f32::EPSILON,
+                "ציון קבוע 1.0 לכל מסמך, התקבל {score}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_options_pattern_now_returns_results() {
+        let (mut engine, _dir) = make_engine();
+        add(&mut engine, 1, "ויאמר משה אל העם", "/books/a.txt");
+        add(&mut engine, 2, "ספר בראשית", "/books/b.txt");
+        engine.commit().unwrap();
+
+        // התבנית המדויקת ש-Dart בונה ל-`משה` עם "חלק ממילה" + "שגיאות כתיב".
+        // כרגקס יחיד היא חורגת ממגבלת ה-1000 states ונכשלת; פיצול ה-BooleanQuery
+        // חייב כעת למצוא את המסמך.
+        let both = "(.{0,3}משה.{0,3}|.{0,3}מסה.{0,3}|.{0,2}משׁה.{0,2}|.{0,2}משׂה.{0,2}|.{0,3}משא.{0,3}|.{0,3}משע.{0,3}|.{0,3}משח.{0,3}|.{0,3}שמה.{0,3}|.{0,3}מהש.{0,3}|.{0,3}שה.{0,3}|.{0,3}מה.{0,3}|.{0,3}מש.{0,3}|.{0,2}ומשה.{0,2}|.{0,2}ימשה.{0,2}|.{0,2}אמשה.{0,2}|.{0,2}המשה.{0,2}|.{0,2}פמשה.{0,2}|.{0,2}למשה.{0,2}|.{0,2}ממשה.{0,2}|.{0,2}נמשה.{0,2}|.{0,2}במשה.{0,2}|.{0,2}כמשה.{0,2}|.{0,2}שמשה.{0,2}|.{0,2}תמשה.{0,2}|.{0,2}רמשה.{0,2}|.{0,2}משהו.{0,2}|.{0,2}משהי.{0,2}|.{0,2}משהא.{0,2}|.{0,2}משהה.{0,2}|.{0,2}משהפ.{0,2}|.{0,2}משהל.{0,2}|.{0,2}משהמ.{0,2}|.{0,2}משהנ.{0,2}|.{0,2}משהב.{0,2}|.{0,2}משהכ.{0,2}|.{0,2}משהש.{0,2}|.{0,2}משהת.{0,2}|.{0,2}משהר.{0,2}|.{0,2}מושה.{0,2}|.{0,2}מישה.{0,2}|.{0,2}מאשה.{0,2}|.{0,2}מהשה.{0,2}|.{0,2}מפשה.{0,2}|.{0,2}מלשה.{0,2}|.{0,2}מנשה.{0,2}|.{0,2}מבשה.{0,2}|.{0,2}מכשה.{0,2}|.{0,2}מששה.{0,2})";
+        assert_eq!(search_ids(&mut engine, both), vec![1]);
+    }
+
+    #[test]
+    fn single_alternation_matches_same_as_combined_regex() {
+        let (mut engine, _dir) = make_engine();
+        add(&mut engine, 1, "משה", "/books/a.txt");
+        add(&mut engine, 2, "מסה", "/books/b.txt");
+        add(&mut engine, 3, "בראשית", "/books/c.txt");
+        engine.commit().unwrap();
+
+        // OR של שני ענפים — מאתר את שני המסמכים, לא את השלישי.
+        let mut ids = search_ids(&mut engine, "(משה|מסה)");
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2]);
     }
 
     #[test]
