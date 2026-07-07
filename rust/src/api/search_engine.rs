@@ -2108,6 +2108,12 @@ impl SearchEngine {
 
     // -- Exact -------------------------------------------------------------------
 
+    /// Paged exact search. Returns results only, dropping the truncation flag:
+    /// the mark-free path never degrades, but the vocalized single-word path
+    /// can (its term set is materialized like an advanced word). Not suitable
+    /// for UI that must tell the user the result is partial — use
+    /// [`Self::search_and_count_exact`] ([`SearchPageResult::truncated`]) or
+    /// [`Self::search_exact_stream_with_counts`] instead.
     pub fn search_exact(
         &self,
         query: String,
@@ -2156,6 +2162,9 @@ impl SearchEngine {
         )
     }
 
+    /// Streaming exact search. Streams results only, dropping the truncation
+    /// flag — see [`Self::search_exact`]; use
+    /// [`Self::search_exact_stream_with_counts`] when partiality must surface.
     #[allow(clippy::too_many_arguments)]
     pub fn search_exact_stream(
         &self,
@@ -2331,6 +2340,12 @@ impl SearchEngine {
 
     // -- Advanced ----------------------------------------------------------------
 
+    /// Paged advanced (morphological regex) search. Returns results only,
+    /// dropping the truncation flag: a broad word whose term collection
+    /// overflows its budget serves partial results with no signal. Not
+    /// suitable for UI that must tell the user the result is partial — use
+    /// [`Self::search_and_count_advanced`] ([`SearchPageResult::truncated`])
+    /// or [`Self::search_advanced_stream_with_counts`] instead.
     pub fn search_advanced(
         &self,
         query: String,
@@ -2890,6 +2905,13 @@ impl SearchEngine {
 
     // -- Fuzzy -------------------------------------------------------------------
 
+    /// Paged fuzzy search. Returns results only, dropping the truncation flag:
+    /// the mark-free path uses its own automaton budgets and never degrades,
+    /// but the vocalized path can (its term set is materialized like an
+    /// advanced word). Not suitable for UI that must tell the user the result
+    /// is partial — use [`Self::search_and_count_fuzzy`]
+    /// ([`SearchPageResult::truncated`]) or
+    /// [`Self::search_fuzzy_stream_with_counts`] instead.
     #[allow(clippy::too_many_arguments)]
     pub fn search_fuzzy(
         &self,
@@ -2973,6 +2995,9 @@ impl SearchEngine {
         )
     }
 
+    /// Streaming fuzzy search. Streams results only, dropping the truncation
+    /// flag — see [`Self::search_fuzzy`]; use
+    /// [`Self::search_fuzzy_stream_with_counts`] when partiality must surface.
     #[allow(clippy::too_many_arguments)]
     pub fn search_fuzzy_stream(
         &self,
@@ -10354,6 +10379,137 @@ mod tests {
             )
             .unwrap();
         assert!(exact_only.is_empty());
+    }
+
+    /// סימנים צמודים שהטוקנייזר המנוקד שומר כמות-שהם (12 ניקוד + 4 טעמים).
+    /// סימן אחד לכל אות בסיס — כך שאין שני סימנים סמוכים שסדרם עלול לקרוס
+    /// לאותו טרם.
+    const VOC_TRUNC_MARKS: &[char] = &[
+        '\u{05B0}', '\u{05B1}', '\u{05B2}', '\u{05B3}', '\u{05B4}', '\u{05B5}', '\u{05B6}',
+        '\u{05B7}', '\u{05B8}', '\u{05B9}', '\u{05BA}', '\u{05BB}', '\u{0591}', '\u{0592}',
+        '\u{0593}', '\u{0594}',
+    ];
+
+    /// בונה מנוע שבמילון המנוקד שלו `count` ניקודים מובחנים של השלד "בבבב"
+    /// (בסיס-17 על ארבע עמדות-סימן: 0 = אות חשופה, 1..=16 = סימן יחיד).
+    /// שאילתת "בבבב" חשופה עם דגל ניקוד דלוק מוצאת את כולם, כך ש-`count`
+    /// מעל תקרת-הטרמים של מסלול מכריח את איסוף המילה-היחידה להתדרדר. מילת
+    /// בקרה יחידה ("שָׁלוֹם") נותנת למבחני מתחת-לתקרה טרם מדויק לפגוע בו.
+    fn make_voc_truncation_engine(count: usize) -> (SearchEngine, TempDir) {
+        let (mut engine, dir) = make_engine();
+        let radix = VOC_TRUNC_MARKS.len() + 1; // 17
+        let mut words: Vec<String> = Vec::with_capacity(count);
+        for i in 0..count {
+            let mut n = i;
+            let mut w = String::new();
+            for _ in 0..4 {
+                w.push('ב');
+                let digit = n % radix;
+                n /= radix;
+                if digit > 0 {
+                    w.push(VOC_TRUNC_MARKS[digit - 1]);
+                }
+            }
+            words.push(w);
+        }
+        // ~2000 מילים לשורה: כל שורה נושאת סימנים (→ שדה מנוקד) וכל טרם
+        // מופיע במסמך אחד (doc_freq=1, תקציב ה-postings לא נוגע).
+        let mut text = String::from("<h1>בדיקה</h1>\n");
+        for chunk in words.chunks(2000) {
+            text.push_str(&chunk.join(" "));
+            text.push('\n');
+        }
+        text.push_str("שָׁלוֹם\n");
+        engine
+            .add_text_book(
+                "בדיקה".to_string(),
+                "/root".to_string(),
+                "/books/voc.txt".to_string(),
+                1,
+                DEFAULT_GENERATION_ORDER,
+                text,
+            )
+            .unwrap();
+        engine.commit().unwrap();
+        (engine, dir)
+    }
+
+    #[test]
+    fn vocalized_exact_count_with_status_surfaces_truncation() {
+        // המסלול המנוקד החד-מילתי מממש סט טרמים חסום ב-
+        // VOC_EXACT_SINGLE_MAX_EXPANSIONS; חריגה ממנו חייבת להדליק את הדגל
+        // שה-API החדש נושא, לא להתדרדר בשקט.
+        let (engine, _dir) =
+            make_voc_truncation_engine(VOC_EXACT_SINGLE_MAX_EXPANSIONS as usize + 64);
+
+        let capped = engine
+            .count_exact_with_status("בבבב".to_string(), vec![], true, false)
+            .unwrap();
+        assert!(
+            capped.truncated,
+            "מעל תקרת ה-exact המנוקד הספירה חייבת לסמן truncation"
+        );
+
+        let books = engine
+            .count_by_book_exact_with_status("בבבב".to_string(), vec![], true, false)
+            .unwrap();
+        assert!(books.truncated, "ספירת per-book נושאת אותו דגל");
+
+        let facets = engine
+            .get_facet_counts_exact_with_status(
+                "בבבב".to_string(),
+                vec![],
+                "/".to_string(),
+                true,
+                false,
+            )
+            .unwrap();
+        assert!(facets.truncated, "ספירת ה-facets נושאת אותו דגל");
+
+        // מילה שמוצאת טרם מנוקד יחיד נשארת הרחק מתחת לתקרה: מדויק.
+        let control = engine
+            .count_exact_with_status("שלום".to_string(), vec![], true, false)
+            .unwrap();
+        assert!(!control.truncated, "מילה בת טרם יחיד לא מסמנת truncation");
+        assert_eq!(control.count, 1);
+    }
+
+    #[test]
+    fn vocalized_fuzzy_count_with_status_surfaces_truncation() {
+        // מרחק 0 → רק ענף התבנית המנוקדת המדויקת (בלי הרחבת מרחק-עריכה),
+        // חסום ב-VOC_FUZZY_MAX_EXPANSIONS; חריגה מדליקה את הדגל.
+        let (engine, _dir) = make_voc_truncation_engine(VOC_FUZZY_MAX_EXPANSIONS as usize + 64);
+
+        let capped = engine
+            .count_fuzzy_with_status("בבבב".to_string(), vec![], 0, true, false)
+            .unwrap();
+        assert!(
+            capped.truncated,
+            "מעל תקרת ה-fuzzy המנוקד הספירה חייבת לסמן truncation"
+        );
+
+        let books = engine
+            .count_by_book_fuzzy_with_status("בבבב".to_string(), vec![], 0, true, false)
+            .unwrap();
+        assert!(books.truncated, "ספירת per-book נושאת אותו דגל");
+
+        let facets = engine
+            .get_facet_counts_fuzzy_with_status(
+                "בבבב".to_string(),
+                vec![],
+                "/".to_string(),
+                0,
+                true,
+                false,
+            )
+            .unwrap();
+        assert!(facets.truncated, "ספירת ה-facets נושאת אותו דגל");
+
+        let control = engine
+            .count_fuzzy_with_status("שלום".to_string(), vec![], 0, true, false)
+            .unwrap();
+        assert!(!control.truncated, "מילה בת טרם יחיד לא מסמנת truncation");
+        assert_eq!(control.count, 1);
     }
 
     // ── SearchScope: "באותה פסקה" / "תחת אותה כותרת" ─────────────────────
